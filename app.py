@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -14,14 +15,15 @@ except ImportError:
     zxingcpp = None
 
 st.set_page_config(
-    page_title="Siyah Kutu v0.3.2 | Güvenli FEFO & Otomatik Barkod",
+    page_title="Siyah Kutu v0.3.3 | Saha Pilot Sürümü",
     page_icon="🟩",
     layout="wide",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 DURUM_DOSYASI = BASE_DIR / "siyah_kutu_durum.json"
-AKTIF_SURUM = "0.3.2"
+AKTIF_SURUM = "0.3.3"
+VARSAYILAN_TARIH = datetime.date(2026, 11, 24)
 
 KATEGORI_MAX_OMUR = {
     "Günlük Süt": 7,
@@ -43,7 +45,77 @@ REYON_VARSAYILAN_KATEGORI = {
 }
 
 
-# --- 0. DOĞRUDAN PYTHON BARKOD ÇÖZÜCÜ (KOPYALA-YAPIŞTIR YOK) ---
+# --- 0. YARDIMCI FONKSİYONLAR: BARKOD MOD-10 DOĞRULAMA, HASH & KAMERA ---
+def ean_kontrol_basamagi(govde: str) -> int:
+    if len(govde) == 12:  # EAN-13
+        toplam = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(govde))
+    elif len(govde) == 7:  # EAN-8
+        toplam = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(govde))
+    else:
+        return -1
+    return (10 - (toplam % 10)) % 10
+
+
+def barkod_dogrula(kod: str, bilinen_barkodlar: set):
+    kod = (kod or "").strip()
+    if not kod:
+        return False, "bos", ""
+    if kod in bilinen_barkodlar:
+        return True, "katalog", ""
+    if not kod.isdigit():
+        return False, "format", "🚫 Barkod yalnızca rakamlardan oluşmalıdır."
+    if len(kod) == 13:
+        beklenen = ean_kontrol_basamagi(kod[:12])
+        if int(kod[-1]) != beklenen:
+            return (
+                False,
+                "checksum",
+                f"🚫 **Geçersiz EAN-13 Barkod (`{kod}`):** Yazım hatası var! "
+                f"Kontrol basamağı **`{beklenen}`** olmalıydı (`{kod[-1]}` girildi). "
+                "Yanlış ürün açılmaması için form kilitlendi.",
+            )
+        return True, "ean13", ""
+    if len(kod) == 8:
+        beklenen = ean_kontrol_basamagi(kod[:7])
+        if int(kod[-1]) != beklenen:
+            return (
+                False,
+                "checksum",
+                f"🚫 **Geçersiz EAN-8 Barkod (`{kod}`):** Kontrol basamağı **`{beklenen}`** olmalıydı (`{kod[-1]}` girildi).",
+            )
+        return True, "ean8", ""
+    return (
+        False,
+        "uzunluk",
+        f"🚫 **Geçersiz Barkod Uzunluğu ({len(kod)} hane):** Standart 13 haneli EAN-13 veya 8 haneli EAN-8 girin.",
+    )
+
+
+def dosya_bayt_ve_imza(dosya_kaynak, yedek_yol: Path):
+    if dosya_kaynak is not None:
+        bayt = dosya_kaynak.getvalue()
+        ad = getattr(dosya_kaynak, "name", "yuklenen.csv")
+    else:
+        bayt = yedek_yol.read_bytes()
+        ad = yedek_yol.name
+    imza = hashlib.sha256(bayt).hexdigest()[:12]
+    return bayt, ad, imza
+
+
+def guvenli_int_opsiyonel(deger):
+    if pd.isna(deger) or str(deger).strip() == "":
+        return None
+    v = int(float(deger))
+    return v if v > 0 else None
+
+
+def guvenli_float_opsiyonel(deger):
+    if pd.isna(deger) or str(deger).strip() == "":
+        return None
+    v = float(deger)
+    return v if v > 0 else None
+
+
 def barkod_coz(resim_baytlari: bytes):
     if zxingcpp is None or Image is None:
         return None, "eksik_paket"
@@ -77,8 +149,7 @@ def barkod_tarayici_alani(prefix: str, baslik: str):
     with st.expander(baslik, expanded=False):
         if zxingcpp is None:
             st.error(
-                "Barkod çözücü paketi kurulu değil. Terminalde "
-                "`pip install pillow zxing-cpp` çalıştırın veya `requirements.txt` dosyasını güncelleyin."
+                "Barkod çözücü kurulu değil. `requirements.txt` içinde `pillow` ve `zxing-cpp` bulunmalıdır."
             )
             return
 
@@ -115,12 +186,12 @@ def barkod_tarayici_alani(prefix: str, baslik: str):
                 st.session_state[f"{prefix}_bekleyen_barkod"] = ""
                 st.session_state[f"{prefix}_tarama_mesaj"] = (
                     "hata",
-                    "❌ Barkod okunamadı. Yanlış ürüne kayıt önlemek için önceki seçim temizlendi — daha net ve parlamadan tekrar çekin.",
+                    "❌ Barkod okunamadı. Yanlış ürüne kayıt önlemek için önceki seçim temizlendi — tekrar çekin.",
                 )
             st.rerun()
 
 
-# --- 1. KALICI DİSK KAYDI ---
+# --- 1. KALICI DİSK KAYDI & FEFO SATIŞ DÜŞÜM MOTORU ---
 def durumu_diske_yaz(durum: dict):
     with open(DURUM_DOSYASI, "w", encoding="utf-8") as f:
         json.dump(durum, f, ensure_ascii=False, indent=2)
@@ -138,85 +209,115 @@ def durumdan_oku():
     return None
 
 
-def csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu: bool):
-    df_stok = pd.read_csv(
-        stok_dosya if stok_dosya else BASE_DIR / "dun_stok.csv",
-        dtype={"Barkod": str},
-    )
-    df_satis = pd.read_csv(
-        satis_dosya if satis_dosya else BASE_DIR / "t1_satis.csv",
-        dtype={"Barkod": str},
-    )
-    df_irsaliye = pd.read_csv(
-        irsaliye_dosya if irsaliye_dosya else BASE_DIR / "irsaliye.csv",
-        dtype={"Barkod": str},
-    )
+def fefo_satis_uygula(stok_kayitlari: list, satis_haritasi: dict):
+    # Yeni gün başlangıcı: mevcut kalan stok -> gün başı (Dun_Stok) olur
+    for s in stok_kayitlari:
+        s["Dun_Stok"] = int(s["Kalan_Stok"])
+        s["Satilan_Adet"] = 0
+        s["Coklu_Parti_Uyari"] = False
 
-    satis_haritasi = (
-        df_satis.groupby("Barkod")["Satilan_Adet"].sum().to_dict()
-        if not df_satis.empty
-        else {}
-    )
+    gruplar = {}
+    for s in stok_kayitlari:
+        gruplar.setdefault(s["Barkod"], []).append(s)
+
+    toplam_dusulen = 0
+    eslesmeyen_barkodlar = []
+
+    for barkod, satis_miktari in satis_haritasi.items():
+        satis_miktari = int(satis_miktari)
+        if satis_miktari <= 0:
+            continue
+        if barkod not in gruplar:
+            eslesmeyen_barkodlar.append(barkod)
+            continue
+
+        aktif_partiler = [
+            p for p in gruplar[barkod] if int(p["Kalan_Stok"]) > 0
+        ]
+        aktif_partiler.sort(key=lambda x: (x["SKT"], x["Parti_ID"]))
+
+        havuz = satis_miktari
+        for p in aktif_partiler:
+            mevcut = int(p["Kalan_Stok"])
+            dusulen = min(mevcut, havuz)
+            p["Satilan_Adet"] = dusulen
+            p["Kalan_Stok"] = mevcut - dusulen
+            havuz -= dusulen
+            toplam_dusulen += dusulen
+
+        if len(aktif_partiler) >= 2:
+            for idx, p in enumerate(aktif_partiler):
+                yeni_aktif_var_mi = any(
+                    diger["Kalan_Stok"] > 0 for diger in aktif_partiler[idx + 1:]
+                )
+                if p["Satilan_Adet"] > 0 and p["Kalan_Stok"] == 0 and yeni_aktif_var_mi:
+                    p["Sifir_Dogrulama_Gerekli"] = True
+                elif p["Satilan_Adet"] > 0 and p["Kalan_Stok"] > 0 and yeni_aktif_var_mi:
+                    p["Coklu_Parti_Uyari"] = True
+
+    return toplam_dusulen, eslesmeyen_barkodlar
+
+
+def csvden_baslat(
+    stok_dosya,
+    satis_dosya,
+    irsaliye_dosya,
+    satis_dusulsun_mu: bool,
+    baslangic_tarihi: datetime.date,
+):
+    stok_bayt, _, _ = dosya_bayt_ve_imza(stok_dosya, BASE_DIR / "dun_stok.csv")
+    satis_bayt, satis_ad, satis_imza = dosya_bayt_ve_imza(satis_dosya, BASE_DIR / "t1_satis.csv")
+    irs_bayt, _, _ = dosya_bayt_ve_imza(irsaliye_dosya, BASE_DIR / "irsaliye.csv")
+
+    df_stok = pd.read_csv(io.BytesIO(stok_bayt), dtype={"Barkod": str})
+    df_satis = pd.read_csv(io.BytesIO(satis_bayt), dtype={"Barkod": str})
+    df_irsaliye = pd.read_csv(io.BytesIO(irs_bayt), dtype={"Barkod": str})
 
     df_stok["_skt_sira"] = pd.to_datetime(df_stok["SKT"])
     df_stok = df_stok.sort_values(by=["Barkod", "_skt_sira"]).reset_index(drop=True)
 
-    kalan_satis_havuzu = {str(k).strip(): int(v) for k, v in satis_haritasi.items()}
     stok_kayitlari = []
-
     for idx, r in df_stok.iterrows():
         barkod = str(r["Barkod"]).strip()
         dun_stok = int(r["Dun_Stok"])
-
-        if satis_dusulsun_mu:
-            havuz = kalan_satis_havuzu.get(barkod, 0)
-            dusulen = min(dun_stok, havuz)
-            kalan_stok = max(0, dun_stok - dusulen)
-            kalan_satis_havuzu[barkod] = max(0, havuz - dusulen)
-        else:
-            dusulen = 0
-            kalan_stok = dun_stok
-
         stok_kayitlari.append({
             "Parti_ID": f"P-{idx + 1:03d}",
             "Barkod": barkod,
             "Urun_Adi": str(r["Urun_Adi"]),
             "Reyon": str(r["Reyon"]),
             "Dun_Stok": dun_stok,
-            "Satilan_Adet": dusulen,
-            "Kalan_Stok": kalan_stok,
-            "Gunluk_Hiz": max(int(r["Gunluk_Hiz"]), 1),
+            "Satilan_Adet": 0,
+            "Kalan_Stok": dun_stok,
+            "Gunluk_Hiz": guvenli_int_opsiyonel(r.get("Gunluk_Hiz")),
             "SKT": str(r["SKT"]),
-            "Birim_Fiyat": float(r["Birim_Fiyat"]),
+            "Birim_Fiyat": guvenli_float_opsiyonel(r.get("Birim_Fiyat")),
             "Kaynak": "T+1 FEFO Motoru" if satis_dusulsun_mu else "Gün Sonu Kapanış Stoğu",
             "Coklu_Parti_Uyari": False,
             "Sifir_Dogrulama_Gerekli": False,
             "Son_Aksiyon_Tarihi": None,
             "Son_Aksiyon_Tipi": "",
+            "Son_Fiziksel_Kontrol": None,
             "Mudahale_Notu": "",
         })
 
-    gruplar = {}
-    for s in stok_kayitlari:
-        gruplar.setdefault(s["Barkod"], []).append(s)
-
-    for barkod, partiler in gruplar.items():
-        if len(partiler) < 2:
-            continue
-
-        partiler_sirali = sorted(partiler, key=lambda x: x["SKT"])
-        toplam_satis = int(satis_haritasi.get(barkod, 0)) if satis_dusulsun_mu else 0
-        if toplam_satis <= 0:
-            continue
-
-        for idx, p in enumerate(partiler_sirali):
-            yeni_aktif_var_mi = any(
-                diger["Kalan_Stok"] > 0 for diger in partiler_sirali[idx + 1:]
-            )
-            if p["Satilan_Adet"] > 0 and p["Kalan_Stok"] == 0 and yeni_aktif_var_mi:
-                p["Sifir_Dogrulama_Gerekli"] = True
-            elif p["Satilan_Adet"] > 0 and p["Kalan_Stok"] > 0 and yeni_aktif_var_mi:
-                p["Coklu_Parti_Uyari"] = True
+    islenen_satis_imzalari = []
+    if satis_dusulsun_mu and not df_satis.empty:
+        satis_haritasi = {
+            str(k).strip(): int(v)
+            for k, v in df_satis.groupby("Barkod")["Satilan_Adet"].sum().to_dict().items()
+        }
+        toplam_dusulen, _ = fefo_satis_uygula(stok_kayitlari, satis_haritasi)
+        islenen_satis_imzalari.append({
+            "imza": satis_imza,
+            "dosya": satis_ad,
+            "tarih": baslangic_tarihi.isoformat(),
+            "toplam_adet": toplam_dusulen,
+        })
+        uygulanan_mod = "Satış Öncesi Stok (T+1 FEFO Düşüldü)"
+        son_imza = satis_imza
+    else:
+        uygulanan_mod = "Satış Sonrası Kapanış Stoğu (Satış Düşülmedi)"
+        son_imza = "Satış Düşülmedi"
 
     katalog_map = {}
     for _, r in df_stok.iterrows():
@@ -228,8 +329,8 @@ def csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu: bo
             "Reyon": str(r["Reyon"]),
             "Kategori": kat,
             "Max_Raf_Omru_Gun": KATEGORI_MAX_OMUR.get(kat, 90),
-            "Gunluk_Hiz": max(int(r["Gunluk_Hiz"]), 1),
-            "Birim_Fiyat": float(r["Birim_Fiyat"]),
+            "Gunluk_Hiz": guvenli_int_opsiyonel(r.get("Gunluk_Hiz")),
+            "Birim_Fiyat": guvenli_float_opsiyonel(r.get("Birim_Fiyat")),
         }
 
     irsaliye_listesi = []
@@ -241,8 +342,8 @@ def csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu: bo
             "Reyon": str(r["Reyon"]),
             "Kategori": str(r["Kategori"]),
             "Max_Raf_Omru_Gun": int(r["Max_Raf_Omru_Gun"]),
-            "Gunluk_Hiz": max(int(r["Gunluk_Hiz"]), 1),
-            "Birim_Fiyat": float(r["Birim_Fiyat"]),
+            "Gunluk_Hiz": guvenli_int_opsiyonel(r.get("Gunluk_Hiz")),
+            "Birim_Fiyat": guvenli_float_opsiyonel(r.get("Birim_Fiyat")),
         }
         irsaliye_listesi.append({
             "Satir_ID": f"IRS-{idx + 1:03d}",
@@ -252,8 +353,8 @@ def csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu: bo
             "Kategori": str(r["Kategori"]),
             "Beklenen_Adet": int(r["Beklenen_Adet"]),
             "Max_Raf_Omru_Gun": int(r["Max_Raf_Omru_Gun"]),
-            "Gunluk_Hiz": max(int(r["Gunluk_Hiz"]), 1),
-            "Birim_Fiyat": float(r["Birim_Fiyat"]),
+            "Gunluk_Hiz": guvenli_int_opsiyonel(r.get("Gunluk_Hiz")),
+            "Birim_Fiyat": guvenli_float_opsiyonel(r.get("Birim_Fiyat")),
         })
 
     durum = {
@@ -265,13 +366,17 @@ def csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu: bo
         "kabul_kayitlari": [],
         "aksiyon_loglari": [],
         "satis_dusuldu_mu": satis_dusulsun_mu,
+        "son_pos_gunu": baslangic_tarihi.isoformat(),
+        "uygulanan_pos_modu": uygulanan_mod,
+        "son_satis_imza": son_imza,
+        "islenen_satis_imzalari": islenen_satis_imzalari,
         "parti_sayaci": len(stok_kayitlari) + 1,
     }
     durumu_diske_yaz(durum)
     return durum
 
 
-# --- 2. PAYLAŞIMLI KAPASİTE + TARİH BAZLI RİSK ANALİZ MOTORU ---
+# --- 2. DENETİM ÖNCELİKLİ + OPSİYONEL HIZLI FEFO ANALİZ MOTORU ---
 def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
     tarih_str = tarih.isoformat()
 
@@ -285,14 +390,15 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
         for p in partiler:
             gun = (datetime.date.fromisoformat(p["SKT"]) - tarih).days
             stok = int(p["Kalan_Stok"])
-            if stok > 0 and gun >= 1:
+            hiz = p.get("Gunluk_Hiz")
+            if stok > 0 and gun >= 1 and hiz is not None and int(hiz) > 0:
                 aktifler.append((gun, p["Parti_ID"], p))
 
         aktifler.sort(key=lambda x: (x[0], x[1]))
         kullanilan_kapasite = 0
 
         for gun, pid, p in aktifler:
-            hiz = max(int(p["Gunluk_Hiz"]), 1)
+            hiz = int(p["Gunluk_Hiz"])
             stok = int(p["Kalan_Stok"])
             toplam_kapasite = hiz * gun
             uygun_kapasite = max(0, toplam_kapasite - kullanilan_kapasite)
@@ -311,10 +417,14 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
         pid = p["Parti_ID"]
         stok = int(p["Kalan_Stok"])
         gun = (datetime.date.fromisoformat(p["SKT"]) - tarih).days
-        hiz = max(int(p["Gunluk_Hiz"]), 1)
-        fiyat = float(p["Birim_Fiyat"])
+        hiz = p.get("Gunluk_Hiz")
+        hiz_biliniyor = hiz is not None and int(hiz) > 0
+        fiyat = p.get("Birim_Fiyat")
+        fiyat_sayisal = float(fiyat) if fiyat is not None else 0.0
+
         kap = kapasite_sonuclari.get(
-            pid, {"Paylasimli_Kapasite": 0, "Elde_Kalacak_Adet": 0, "Onceki_Parti_Yuk": 0}
+            pid,
+            {"Paylasimli_Kapasite": None, "Elde_Kalacak_Adet": 0, "Onceki_Parti_Yuk": 0},
         )
 
         bugun_one_cekildi = (
@@ -323,10 +433,24 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
         )
 
         if p.get("Sifir_Dogrulama_Gerekli"):
-            durum_kod = "KIRMIZI" if gun <= 1 else "TURUNCU"
+            if gun <= 0:
+                durum_kod = "KIRMIZI"
+                katman = 5
+                etiket = "⚖️ KRİTİK DENETİM (ARKADA KALMIŞ OLABİLİR)"
+            elif gun == 1:
+                durum_kod = "KIRMIZI"
+                katman = 4
+                etiket = "⚖️ DENETİM RİSKİ (ESKİ PARTİ DOĞRULA)"
+            else:
+                durum_kod = "TURUNCU"
+                katman = 3
+                etiket = "🔍 ESKİ PARTİ DOĞRULAMA"
+
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": durum_kod,
+                "Oncelik_Katmani": katman,
+                "Oncelik_Etiketi": etiket,
                 "Risk_Adet": 0,
                 "Risk_TL": 0.0,
                 "Satilabilir_Mi": gun > 0,
@@ -335,18 +459,20 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
                 "Elde_Kalacak_Adet": 0,
                 "Aksiyon_Mesaji": (
                     f"Hesapta 0 görünüyor (dün {p['Satilan_Adet']} düşüldü) ama öndeki yeni koliden satılmış olabilir. "
-                    f"{p['SKT']} tarihli paketten rafta kaldı mı?"
+                    f"Denetim riski: {p['SKT']} tarihli paketten rafta kaldı mı?"
                 ),
             }
         elif stok <= 0:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "YESIL",
+                "Oncelik_Katmani": 1,
+                "Oncelik_Etiketi": "🟢 TEMİZ",
                 "Risk_Adet": 0,
                 "Risk_TL": 0.0,
                 "Satilabilir_Mi": False,
                 "Gorev_Tipi": "TEMIZ",
-                "Paylasimli_Kapasite": 0,
+                "Paylasimli_Kapasite": 0 if hiz_biliniyor else None,
                 "Elde_Kalacak_Adet": 0,
                 "Aksiyon_Mesaji": p.get("Mudahale_Notu") or "Stok sıfır — kontrole gerek yok",
             }
@@ -354,18 +480,22 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "KIRMIZI",
+                "Oncelik_Katmani": 5,
+                "Oncelik_Etiketi": "⚖️ KRİTİK DENETİM (SKT DOLDU)",
                 "Risk_Adet": stok,
-                "Risk_TL": round(stok * fiyat, 2),
+                "Risk_TL": round(stok * fiyat_sayisal, 2),
                 "Satilabilir_Mi": False,
                 "Gorev_Tipi": "SKT_DOLDU",
                 "Paylasimli_Kapasite": 0,
                 "Elde_Kalacak_Adet": stok,
-                "Aksiyon_Mesaji": "SKT doldu — raftan topla ve fire/iadeye ayır",
+                "Aksiyon_Mesaji": "SKT doldu — denetim riskini sıfırlamak için hemen raftan topla",
             }
         elif bugun_one_cekildi:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "YESIL",
+                "Oncelik_Katmani": 1,
+                "Oncelik_Etiketi": "🟢 BUGÜN KONTROL EDİLDİ",
                 "Risk_Adet": 0,
                 "Risk_TL": 0.0,
                 "Satilabilir_Mi": True,
@@ -378,14 +508,48 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "KIRMIZI",
+                "Oncelik_Katmani": 4,
+                "Oncelik_Etiketi": "⚖️ DENETİM RİSKİ (YARIN SON GÜN)",
                 "Risk_Adet": stok,
-                "Risk_TL": round(stok * fiyat, 2),
+                "Risk_TL": round(stok * fiyat_sayisal, 2),
                 "Satilabilir_Mi": True,
                 "Gorev_Tipi": "SON_GUN",
                 "Paylasimli_Kapasite": kap["Paylasimli_Kapasite"],
                 "Elde_Kalacak_Adet": kap["Elde_Kalacak_Adet"],
                 "Aksiyon_Mesaji": "Yarın son gün — raftaki adedi doğrula, acil indirim/öne çek",
             }
+        elif not hiz_biliniyor:
+            if gun <= 3:
+                sonuc = {
+                    "Kalan_Gun": gun,
+                    "Durum": "TURUNCU",
+                    "Oncelik_Katmani": 2,
+                    "Oncelik_Etiketi": "🟠 HIZ BİLİNMİYOR (TARİH UYARISI)",
+                    "Risk_Adet": stok,
+                    "Risk_TL": round(stok * fiyat_sayisal, 2),
+                    "Satilabilir_Mi": True,
+                    "Gorev_Tipi": "HIZ_BILINMIYOR_TARIH",
+                    "Paylasimli_Kapasite": None,
+                    "Elde_Kalacak_Adet": 0,
+                    "Aksiyon_Mesaji": (
+                        f"Satış hızı henüz bilinmiyor (POS geçmişi bekleniyor). "
+                        f"SKT'ye {gun} gün kaldı — raftan kontrol et / öne çek"
+                    ),
+                }
+            else:
+                sonuc = {
+                    "Kalan_Gun": gun,
+                    "Durum": "YESIL",
+                    "Oncelik_Katmani": 1,
+                    "Oncelik_Etiketi": "🟢 TEMİZ (HIZ BEKLENİYOR)",
+                    "Risk_Adet": 0,
+                    "Risk_TL": 0.0,
+                    "Satilabilir_Mi": True,
+                    "Gorev_Tipi": "TEMIZ",
+                    "Paylasimli_Kapasite": None,
+                    "Elde_Kalacak_Adet": 0,
+                    "Aksiyon_Mesaji": "Satış hızı henüz bilinmiyor — güvenli raf ömrü (>3 gün)",
+                }
         elif kap["Elde_Kalacak_Adet"] > 0:
             elde_kalacak = kap["Elde_Kalacak_Adet"]
             paylasim_notu = (
@@ -396,14 +560,16 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "TURUNCU",
+                "Oncelik_Katmani": 2,
+                "Oncelik_Etiketi": "🟠 HIZ / FİRE RİSKİ",
                 "Risk_Adet": elde_kalacak,
-                "Risk_TL": round(elde_kalacak * fiyat, 2),
+                "Risk_TL": round(elde_kalacak * fiyat_sayisal, 2),
                 "Satilabilir_Mi": True,
                 "Gorev_Tipi": "HIZ_RISKI",
                 "Paylasimli_Kapasite": kap["Paylasimli_Kapasite"],
                 "Elde_Kalacak_Adet": elde_kalacak,
                 "Aksiyon_Mesaji": (
-                    f"{gun} gün kaldı; {hiz}/gün hızla bu partiye kalan kapasite {kap['Paylasimli_Kapasite']} adet"
+                    f"{gun} gün kaldı; {int(hiz)}/gün hızla bu partiye kalan kapasite {kap['Paylasimli_Kapasite']} adet"
                     f"{paylasim_notu}. {elde_kalacak} adet elde kalacak — indirim & öne çek"
                 ),
             }
@@ -411,8 +577,10 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "TURUNCU",
+                "Oncelik_Katmani": 3,
+                "Oncelik_Etiketi": "🔍 ÇOKLU SKT DOĞRULAMA",
                 "Risk_Adet": stok,
-                "Risk_TL": round(stok * fiyat, 2),
+                "Risk_TL": round(stok * fiyat_sayisal, 2),
                 "Satilabilir_Mi": True,
                 "Gorev_Tipi": "COKLU_DOGRULAMA",
                 "Paylasimli_Kapasite": kap["Paylasimli_Kapasite"],
@@ -423,6 +591,8 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
             sonuc = {
                 "Kalan_Gun": gun,
                 "Durum": "YESIL",
+                "Oncelik_Katmani": 1,
+                "Oncelik_Etiketi": "🟢 TEMİZ",
                 "Risk_Adet": 0,
                 "Risk_TL": 0.0,
                 "Satilabilir_Mi": True,
@@ -437,38 +607,18 @@ def tum_partileri_analiz_et(stok_kayitlari: list, tarih: datetime.date) -> list:
     return sonuclar
 
 
-# --- 3. YAN MENÜ ---
-st.sidebar.header("⚙️ Siyah Kutu v0.3.2 Ayarları")
-kontrol_tarihi = st.sidebar.date_input(
-    "Aktif İşlem Tarihi (Gün İlerletme Testi)",
-    value=datetime.date(2026, 11, 24),
-    format="DD.MM.YYYY",
-)
+def oncelik_sirala_anahtari(x: dict):
+    return (
+        x["Oncelik_Katmani"],
+        -x["Kalan_Gun"],
+        1 if not x.get("Son_Fiziksel_Kontrol") else 0,
+        x["Risk_TL"],
+    )
 
-pos_stok_tipi = st.sidebar.radio(
-    "POS Stok Dosyasının Saati",
-    [
-        "Satış Öncesi Stok (T+1 Satışı FEFO Düş)",
-        "Satış Sonrası Kapanış Stoğu (Tekrar Düşme)",
-    ],
-    index=0,
-)
-satis_dusulsun_mu = pos_stok_tipi.startswith("Satış Öncesi")
 
-stok_dosya = st.sidebar.file_uploader("Dün Stok CSV (Opsiyonel)", type=["csv"])
-satis_dosya = st.sidebar.file_uploader("Gece T+1 Satış CSV (Opsiyonel)", type=["csv"])
-irsaliye_dosya = st.sidebar.file_uploader("Gizli İrsaliye CSV (Opsiyonel)", type=["csv"])
-
-if st.sidebar.button("🔄 Demoyu Sıfırla (CSV'den Yeniden Başlat)", use_container_width=True):
-    if DURUM_DOSYASI.exists():
-        DURUM_DOSYASI.unlink()
-    st.session_state.durum = csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu)
-    st.session_state.bekleyen_kabul_uyari = None
-    st.session_state.son_ilk_giris_mesaj = None
-    st.session_state.s3_son_islem_mesaj = None
-    st.session_state.s2_bekleyen_barkod = ""
-    st.session_state.s3_bekleyen_barkod = ""
-    st.rerun()
+# --- 3. BAŞLANGIÇ DURUMU & YAN MENÜ ---
+if "bekleyen_tarih" in st.session_state:
+    st.session_state["aktif_tarih"] = st.session_state.pop("bekleyen_tarih")
 
 if "durum" not in st.session_state:
     disk_durum = durumdan_oku()
@@ -476,14 +626,130 @@ if "durum" not in st.session_state:
         st.session_state.durum = disk_durum
     else:
         try:
-            st.session_state.durum = csvden_baslat(stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu)
+            st.session_state.durum = csvden_baslat(
+                None, None, None, True, VARSAYILAN_TARIH
+            )
         except FileNotFoundError as e:
             st.error(f"Eksik CSV dosyası: {e.filename}. Tüm CSV dosyaları `app.py` ile aynı klasörde olmalı.")
             st.stop()
 
 durum = st.session_state.durum
-if durum.get("satis_dusuldu_mu") != satis_dusulsun_mu:
-    st.sidebar.info("POS stok saati değişti. Uygulamak için 'Demoyu Sıfırla'ya basın.")
+son_pos_tarih_obj = datetime.date.fromisoformat(durum["son_pos_gunu"])
+st.session_state.setdefault("aktif_tarih", son_pos_tarih_obj)
+
+st.sidebar.header("⚙️ Siyah Kutu v0.3.3")
+kontrol_tarihi = st.sidebar.date_input(
+    "Aktif Radar Tarihi",
+    key="aktif_tarih",
+    format="DD.MM.YYYY",
+)
+
+# --- YENİ GÜN T+1 AKIŞI (STOK KORUNUR + ÇİFT DOSYA KİLİDİ) ---
+st.sidebar.divider()
+st.sidebar.subheader("☀️ Yeni Gün T+1 Satışı İşle")
+st.sidebar.caption("Mevcut stoğu ve yeni gelen partileri silmeden sadece ertesi günün satışını FEFO düşer.")
+
+yeni_gun_satis_dosya = st.sidebar.file_uploader(
+    "Yeni Gün Satış CSV (Barkod, Satilan_Adet)",
+    type=["csv"],
+    key="yeni_gun_csv_uploader",
+)
+yeni_gun_tarih = st.sidebar.date_input(
+    "İşlenecek Yeni POS Günü",
+    value=son_pos_tarih_obj + datetime.timedelta(days=1),
+    format="DD.MM.YYYY",
+    key="yeni_gun_tarih_input",
+)
+
+if st.sidebar.button(
+    "☀️ Yeni Gün Satışını FEFO Düş",
+    type="primary",
+    disabled=(yeni_gun_satis_dosya is None),
+    use_container_width=True,
+):
+    bayt = yeni_gun_satis_dosya.getvalue()
+    imza = hashlib.sha256(bayt).hexdigest()[:12]
+    mevcut_kayit = next(
+        (k for k in durum.get("islenen_satis_imzalari", []) if k["imza"] == imza),
+        None,
+    )
+    if mevcut_kayit:
+        st.session_state["pos_islem_mesaj"] = (
+            "hata",
+            f"🚫 **ÇİFT İŞLEME KİLİDİ:** Bu satış dosyası (`{imza}`) daha önce "
+            f"**{mevcut_kayit['tarih']}** günü için işlendi ({mevcut_kayit['toplam_adet']} adet düşüldü). "
+            "Aynı POS dosyasının ikinci kez düşülmesi engellendi.",
+        )
+    else:
+        try:
+            df_yeni_satis = pd.read_csv(io.BytesIO(bayt), dtype={"Barkod": str})
+            if not {"Barkod", "Satilan_Adet"}.issubset(df_yeni_satis.columns):
+                st.session_state["pos_islem_mesaj"] = (
+                    "hata",
+                    "❌ CSV dosyasında `Barkod` ve `Satilan_Adet` sütunları bulunmalıdır.",
+                )
+            else:
+                satis_haritasi = {
+                    str(k).strip(): int(v)
+                    for k, v in df_yeni_satis.groupby("Barkod")["Satilan_Adet"].sum().to_dict().items()
+                }
+                toplam_dusulen, eslesmeyen = fefo_satis_uygula(durum["stok_kayitlari"], satis_haritasi)
+                durum["son_pos_gunu"] = yeni_gun_tarih.isoformat()
+                durum["uygulanan_pos_modu"] = "Artımlı Yeni Gün T+1 (FEFO Düşüldü)"
+                durum["son_satis_imza"] = imza
+                durum.setdefault("islenen_satis_imzalari", []).append({
+                    "imza": imza,
+                    "dosya": yeni_gun_satis_dosya.name,
+                    "tarih": yeni_gun_tarih.isoformat(),
+                    "toplam_adet": toplam_dusulen,
+                })
+                durumu_diske_yaz(durum)
+                st.session_state["bekleyen_tarih"] = yeni_gun_tarih
+                ek_uyari = f" (Stokta bulunmayan {len(eslesmeyen)} barkod atlandı)" if eslesmeyen else ""
+                st.session_state["pos_islem_mesaj"] = (
+                    "ok",
+                    f"✅ **{yeni_gun_tarih.strftime('%d.%m.%Y')}** T+1 satışı işlendi: "
+                    f"toplam **{toplam_dusulen} adet** FEFO sırasıyla düşüldü (İmza: `{imza}`).{ek_uyari}",
+                )
+        except Exception as exc:
+            st.session_state["pos_islem_mesaj"] = ("hata", f"❌ Satış dosyası okunamadı: {exc}")
+    st.rerun()
+
+# --- DEMO SIFIRLAMA (AYRI BÖLÜM) ---
+st.sidebar.divider()
+with st.sidebar.expander("🔄 Demo Başlangıcı / Sıfırlama", expanded=False):
+    st.caption("Dikkat: Sıfırlama tüm manuel girişleri silip başlangıç CSV'lerinden yeniden kurar.")
+    pos_stok_tipi = st.radio(
+        "Başlangıç POS Stok Saati",
+        [
+            "Satış Öncesi Stok (T+1 Satışı FEFO Düş)",
+            "Satış Sonrası Kapanış Stoğu (Tekrar Düşme)",
+        ],
+        index=0 if durum.get("satis_dusuldu_mu", True) else 1,
+    )
+    satis_dusulsun_mu = pos_stok_tipi.startswith("Satış Öncesi")
+
+    if durum.get("satis_dusuldu_mu") != satis_dusulsun_mu:
+        st.warning("Seçili başlangıç modu henüz uygulanmadı. Uygulamak için aşağıdaki 'Demoyu Sıfırla' butonuna basın.")
+
+    stok_dosya = st.file_uploader("Dün Stok CSV (Opsiyonel)", type=["csv"], key="reset_stok")
+    satis_dosya = st.file_uploader("Gece T+1 Satış CSV (Opsiyonel)", type=["csv"], key="reset_satis")
+    irsaliye_dosya = st.file_uploader("Gizli İrsaliye CSV (Opsiyonel)", type=["csv"], key="reset_irs")
+
+    if st.button("🔄 Demoyu Sıfırla (Baştan Kur)", use_container_width=True):
+        if DURUM_DOSYASI.exists():
+            DURUM_DOSYASI.unlink()
+        st.session_state.durum = csvden_baslat(
+            stok_dosya, satis_dosya, irsaliye_dosya, satis_dusulsun_mu, VARSAYILAN_TARIH
+        )
+        st.session_state["bekleyen_tarih"] = VARSAYILAN_TARIH
+        st.session_state["bekleyen_kabul_uyari"] = None
+        st.session_state["son_ilk_giris_mesaj"] = None
+        st.session_state["s3_son_islem_mesaj"] = None
+        st.session_state["pos_islem_mesaj"] = None
+        st.session_state["s2_bekleyen_barkod"] = ""
+        st.session_state["s3_bekleyen_barkod"] = ""
+        st.rerun()
 
 yarin_satirlari = [
     {
@@ -491,9 +757,9 @@ yarin_satirlari = [
         "Urun_Adi": p["Urun_Adi"],
         "Reyon": p["Reyon"],
         "Dun_Stok": p["Kalan_Stok"],
-        "Gunluk_Hiz": p["Gunluk_Hiz"],
+        "Gunluk_Hiz": "" if p.get("Gunluk_Hiz") is None else p["Gunluk_Hiz"],
         "SKT": p["SKT"],
-        "Birim_Fiyat": p["Birim_Fiyat"],
+        "Birim_Fiyat": "" if p.get("Birim_Fiyat") is None else p["Birim_Fiyat"],
     }
     for p in durum["stok_kayitlari"]
     if int(p["Kalan_Stok"]) > 0
@@ -506,34 +772,48 @@ st.sidebar.download_button(
     mime="text/csv",
     use_container_width=True,
 )
-st.sidebar.caption("🛡️ Saha Pilot Güvenliği: Boş varsayılanlar ve otomatik temizleme aktif.")
 
 
 # --- 4. ANA BAŞLIK VE 3 SEKME ---
-st.title("🟩 Siyah Kutu v0.3.2 — Güvenli FEFO & Otomatik Barkod")
+st.title("🟩 Siyah Kutu v0.3.3 — Saha Pilot Sürümü")
+
+pos_mesaj = st.session_state.get("pos_islem_mesaj")
+if pos_mesaj:
+    if pos_mesaj[0] == "ok":
+        st.success(pos_mesaj[1])
+    else:
+        st.error(pos_mesaj[1])
+
 tab1, tab2, tab3 = st.tabs([
     "🗺️ 1. Sabah T+1 Renk Radarı",
     "➕ 2. İlk Ürün / Parti Girişi",
-    "📦 3. Kör Sayım (Mal Kabul)",
+    "📦 3. Kör Sayım (Karma SKT)",
 ])
 
 # ==============================================================================
-# SEKME 1: SABAH T+1 RENK RADARI
+# SEKME 1: SABAH T+1 RENK RADARI (DENETİM ÖNCELİKLİ + ŞEFFAF POS BANDI)
 # ==============================================================================
 with tab1:
-    st.caption(
-        f"Aktif Kontrol Tarihi: {kontrol_tarihi.strftime('%d.%m.%Y')} | "
-        "Tarih bazlı kapanış, matematiksel sıfır doğrulama ve paylaşımlı FEFO kapasitesi aktif."
+    son_pos_gosterim = datetime.date.fromisoformat(durum["son_pos_gunu"]).strftime("%d.%m.%Y")
+    st.info(
+        f"📡 **Aktif Radar Verisi** · Son İşlenen POS Günü: **{son_pos_gosterim}** · "
+        f"Fiilen Uygulanan Stok Modu: **{durum['uygulanan_pos_modu']}** · "
+        f"Satış Dosyası İmzası: **`{durum['son_satis_imza']}`**"
     )
+    if kontrol_tarihi.isoformat() != durum["son_pos_gunu"]:
+        st.warning(
+            f"📅 Takvimde **{kontrol_tarihi.strftime('%d.%m.%Y')}** görünümündesiniz; "
+            f"son işlenen POS verisi **{son_pos_gosterim}** tarihine aittir. "
+            "Yeni günün satışını düşmek için sol menüdeki **'☀️ Yeni Gün T+1 Satışı İşle'** bölümünü kullanın."
+        )
 
     analizli_partiler = tum_partileri_analiz_et(durum["stok_kayitlari"], kontrol_tarihi)
-    oncelik_skoru = {"KIRMIZI": 3, "TURUNCU": 2, "YESIL": 1}
 
     reyon_sirasi = list(dict.fromkeys(p["Reyon"] for p in analizli_partiler))
     reyon_ozetleri = []
     for reyon in reyon_sirasi:
         alt = [p for p in analizli_partiler if p["Reyon"] == reyon]
-        alt.sort(key=lambda x: (oncelik_skoru[x["Durum"]], x["Risk_TL"]), reverse=True)
+        alt.sort(key=oncelik_sirala_anahtari, reverse=True)
         en_kotu = alt[0]["Durum"]
         acik_gorev = sum(1 for x in alt if x["Durum"] != "YESIL")
 
@@ -545,6 +825,7 @@ with tab1:
             "Dunku_Satis": sum(int(x["Satilan_Adet"]) for x in alt),
             "Kalan_Stok": sum(int(x["Kalan_Stok"]) for x in alt),
             "Odak_Urun": alt[0]["Urun_Adi"],
+            "Oncelik_Etiketi": alt[0]["Oncelik_Etiketi"],
             "Aksiyon": alt[0]["Aksiyon_Mesaji"],
         })
 
@@ -552,20 +833,20 @@ with tab1:
     yesil_reyon = sum(1 for r in reyon_ozetleri if r["Durum"] == "YESIL")
     saglik_skoru = int((yesil_reyon / toplam_reyon) * 100) if toplam_reyon else 100
     aktif_risk_tl = sum(r["Toplam_Risk_TL"] for r in reyon_ozetleri)
-    kurtarma_aksiyon_tl = sum(log.get("Potansiyel_Kurtarilan_TL", 0.0) for log in durum["aksiyon_loglari"])
+    denetim_sayisi = sum(1 for p in analizli_partiler if p["Oncelik_Katmani"] >= 4)
     gerceklesen_fire_tl = sum(log.get("Gerceklesen_Fire_TL", 0.0) for log in durum["aksiyon_loglari"])
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Mağaza Sağlık Skoru", f"%{saglik_skoru}", f"{yesil_reyon}/{toplam_reyon} Reyon Yeşil")
-    k2.metric("Aktif Risk (TL)", f"{aktif_risk_tl:,.0f} TL")
-    k3.metric("İndirim / Öne Çekme", f"{kurtarma_aksiyon_tl:,.0f} TL")
+    k2.metric("⚖️ Kritik Denetim Görevi", f"{denetim_sayisi} Parti")
+    k3.metric("Aktif Fire Riski (TL)", f"{aktif_risk_tl:,.0f} TL")
     k4.metric("Gerçekleşen Fire (TL)", f"{gerceklesen_fire_tl:,.0f} TL")
 
     st.divider()
 
     st.subheader("🗺️ 2D Mağaza Reyon Haritası")
     renk_stili = {
-        "KIRMIZI": ("#fef2f2", "#dc2626", "#991b1b", "🔴 KRİTİK ALARM"),
+        "KIRMIZI": ("#fef2f2", "#dc2626", "#991b1b", "🔴 KRİTİK / DENETİM"),
         "TURUNCU": ("#fff7ed", "#ea580c", "#9a3412", "🟠 İNDİRİM / DOĞRULAMA"),
         "YESIL":   ("#f0fdf4", "#16a34a", "#166534", "🟢 TEMİZ"),
     }
@@ -589,7 +870,7 @@ with tab1:
                         padding: 15px;
                         margin-bottom: 10px;
                         color: #1f2937;
-                        min-height: 185px;
+                        min-height: 190px;
                     ">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <strong style="font-size:18px; color:{title_color};">{r['Reyon']}</strong>
@@ -597,7 +878,7 @@ with tab1:
                         </div>
                         <hr style="border:none; border-top:1px solid {border}40; margin:8px 0;">
                         <div style="font-size:13px; margin-bottom:4px;"><strong>Durum:</strong> {gorev_yazisi}</div>
-                        <div style="font-size:13px; margin-bottom:4px;"><strong>Öncelikli Ürün:</strong> {r['Odak_Urun']}</div>
+                        <div style="font-size:13px; margin-bottom:4px;"><strong>En Acil Ürün:</strong> {r['Odak_Urun']}</div>
                         <div style="font-size:13px; margin-bottom:6px;">
                             <strong>Dün Satılan:</strong> {r['Dunku_Satis']} | <strong>Kalan:</strong> {r['Kalan_Stok']} | <strong>Risk:</strong> {r['Toplam_Risk_TL']:,.0f} TL
                         </div>
@@ -611,9 +892,9 @@ with tab1:
 
     st.divider()
 
-    st.subheader("🎯 Ürün Bazlı Sabah Görevleri")
+    st.subheader("🎯 Ürün Bazlı Sabah Görevleri (Denetim & Kalan Gün Öncelikli)")
     acik_partiler = [p for p in analizli_partiler if p["Durum"] != "YESIL"]
-    acik_partiler.sort(key=lambda x: (oncelik_skoru[x["Durum"]], x["Risk_TL"]), reverse=True)
+    acik_partiler.sort(key=oncelik_sirala_anahtari, reverse=True)
 
     def kardes_stok_dengele(hedef_parti: dict, fark: int):
         if fark == 0:
@@ -661,8 +942,10 @@ with tab1:
         hedef_parti["Sifir_Dogrulama_Gerekli"] = False
         hedef_parti["Son_Aksiyon_Tarihi"] = tarih_str
         hedef_parti["Son_Aksiyon_Tipi"] = yeni_tip
+        hedef_parti["Son_Fiziksel_Kontrol"] = tarih_str
         hedef_parti["Mudahale_Notu"] = f"{islem_adi} ({kontrol_tarihi.strftime('%d.%m.%Y')})"
 
+        fiyat_sayisal = float(hedef_parti["Birim_Fiyat"]) if hedef_parti.get("Birim_Fiyat") is not None else 0.0
         kurtarilan = 0.0
         fire = 0.0
 
@@ -670,12 +953,15 @@ with tab1:
             hedef_parti["Kalan_Stok"] = sayilan
             kalan_gun = parti_analiz["Kalan_Gun"]
             kapasite = parti_analiz["Paylasimli_Kapasite"]
-            riskli_adet = sayilan if kalan_gun <= 1 else max(0, sayilan - kapasite)
-            kurtarilan = round(riskli_adet * float(hedef_parti["Birim_Fiyat"]), 2)
+            if kalan_gun <= 1 or kapasite is None:
+                riskli_adet = sayilan
+            else:
+                riskli_adet = max(0, sayilan - kapasite)
+            kurtarilan = round(riskli_adet * fiyat_sayisal, 2)
         elif yeni_tip == "TUKENDI":
             hedef_parti["Kalan_Stok"] = 0
         elif yeni_tip == "FIRE_AYRILDI":
-            fire = round(sayilan * float(hedef_parti["Birim_Fiyat"]), 2)
+            fire = round(sayilan * fiyat_sayisal, 2)
             hedef_parti["Kalan_Stok"] = 0
 
         durum["aksiyon_loglari"].insert(0, {
@@ -692,27 +978,24 @@ with tab1:
         durumu_diske_yaz(durum)
 
     if not acik_partiler:
-        st.success(f"🎉 {kontrol_tarihi.strftime('%d.%m.%Y')} için tüm riskli partiler doğrulandı ve kapatıldı. Mağaza %100 Yeşil.")
+        st.success(f"🎉 {kontrol_tarihi.strftime('%d.%m.%Y')} için tüm riskli ve denetim gerektiren partiler kapatıldı. Mağaza %100 Yeşil.")
     else:
-        for p in acik_partiler:
+        for sira_no, p in enumerate(acik_partiler, start=1):
             pid = p["Parti_ID"]
             ikon = "🔴" if p["Durum"] == "KIRMIZI" else "🟠"
             sifir_mi = p["Gorev_Tipi"] == "SIFIR_DOGRULAMA"
-
-            etiket_ek = ""
-            if sifir_mi:
-                etiket_ek = " | 🔍 SIFIRLANAN ESKİ PARTİ DOĞRULAMASI"
-            elif p["Gorev_Tipi"] == "COKLU_DOGRULAMA":
-                etiket_ek = " | ⚠️ ÇOKLU SKT DOĞRULAMASI"
+            hiz_metin = f"{int(p['Gunluk_Hiz'])}/gün" if p.get("Gunluk_Hiz") is not None else "Bilinmiyor"
+            kontrol_notu = p.get("Son_Fiziksel_Kontrol") or "Henüz sayılmadı"
 
             with st.container(border=True):
                 st.markdown(
-                    f"**{ikon} {p['Reyon']} → {p['Urun_Adi']}** "
-                    f"(Parti: `{pid}` · SKT: **{p['SKT']}** · Kalan Gün: **{p['Kalan_Gun']}**{etiket_ek})"
+                    f"**#{sira_no} · {ikon} {p['Reyon']} → {p['Urun_Adi']}** "
+                    f"(Parti: `{pid}` · SKT: **{p['SKT']}** · Kalan Gün: **{p['Kalan_Gun']}** · {p['Oncelik_Etiketi']})"
                 )
                 st.caption(
                     f"Tahmini Kalan: **{p['Kalan_Stok']} adet** (Dün düşülen: {p['Satilan_Adet']}) | "
-                    f"Satış Hızı: {p['Gunluk_Hiz']}/gün | Risk: **{p['Risk_TL']:,.0f} TL** — {p['Aksiyon_Mesaji']}"
+                    f"Satış Hızı: **{hiz_metin}** | Son Fiziksel Kontrol: **{kontrol_notu}** | "
+                    f"Fire Riski: **{p['Risk_TL']:,.0f} TL** — {p['Aksiyon_Mesaji']}"
                 )
 
                 c_sayim, c_b1, c_b2, c_b3 = st.columns([1.2, 1.3, 1.15, 1.2])
@@ -737,7 +1020,7 @@ with tab1:
                         buton_ad = "🟠 Arkada Buldum / Öne Çek" if sifir_mi else "🟠 Öne Çek / İndirim"
                         if st.button(buton_ad, key=f"btn_one_{pid}", use_container_width=True):
                             if fiziksel_adet <= 0:
-                                st.warning("Öne çekmek için rafta kalan adedi 0'dan büyük girin veya 'Rafta Kalmadı'ya basın.")
+                                st.warning("Öne çekmek için adedi 0'dan büyük girin veya 'Rafta Kalmadı'ya basın.")
                             else:
                                 partiyi_guncelle(p, "AKSIYON_ALINDI", fiziksel_adet, "Öne Çekildi / İndirim (Bugün)")
                                 st.rerun()
@@ -768,24 +1051,26 @@ with tab1:
 
     st.divider()
     st.subheader("📊 Tüm Partiler (Paylaşımlı FEFO Canlı Tablo)")
-    st.dataframe(
-        pd.DataFrame(analizli_partiler)[
-            [
-                "Parti_ID", "Reyon", "Urun_Adi", "Dun_Stok", "Satilan_Adet",
-                "Kalan_Stok", "Gunluk_Hiz", "SKT", "Kalan_Gun",
-                "Paylasimli_Kapasite", "Elde_Kalacak_Adet", "Durum", "Risk_TL", "Son_Aksiyon_Tarihi"
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
+    tablo_df = pd.DataFrame(analizli_partiler)[[
+        "Parti_ID", "Barkod", "Reyon", "Urun_Adi", "Dun_Stok", "Satilan_Adet",
+        "Kalan_Stok", "Gunluk_Hiz", "SKT", "Kalan_Gun",
+        "Paylasimli_Kapasite", "Elde_Kalacak_Adet", "Oncelik_Etiketi", "Risk_TL"
+    ]].copy()
+    tablo_df["Gunluk_Hiz"] = tablo_df["Gunluk_Hiz"].apply(lambda v: "Bilinmiyor" if pd.isna(v) else f"{int(v)}/gün")
+    tablo_df["Paylasimli_Kapasite"] = tablo_df["Paylasimli_Kapasite"].apply(
+        lambda v: "Hız Bekleniyor" if pd.isna(v) else int(v)
     )
+    st.dataframe(tablo_df, use_container_width=True, hide_index=True)
 
 # ==============================================================================
-# SEKME 2: İLK ÜRÜN / PARTİ GİRİŞİ (OTOMATİK SEÇİM + BOŞ VARSAYILANLAR)
+# SEKME 2: İLK ÜRÜN / PARTİ GİRİŞİ (EAN-13 KONTROLÜ + OPSİYONEL HIZ/FİYAT)
 # ==============================================================================
 with tab2:
     st.subheader("➕ Yeni Ürün / Parti Girişi")
-    st.caption("Barkodu okuttuğunuzda ürün otomatik tanınır; yeni barkodda önceki seçim temizlenir ve tüm alanlar boş açılır.")
+    st.caption(
+        "Barkod Mod-10 kontrol basamağı anında doğrulanır. Yeni üründe fiyat ve günlük hız opsiyoneldir; "
+        "POS geçmişi oluşana kadar salt tarih kuralıyla izlenir."
+    )
 
     st.session_state.setdefault("s2_barkod", "")
     st.session_state.setdefault("s2_son_barkod", "")
@@ -812,9 +1097,9 @@ with tab2:
     c_b1, c_b2 = st.columns([3, 1])
     with c_b1:
         barkod_giris = st.text_input(
-            "Barkod Numarası",
+            "Barkod Numarası (EAN-13 / EAN-8)",
             key="s2_barkod",
-            placeholder="Yukarıdan barkod okutun veya 13 haneli EAN-13 yazıp Enter'a basın...",
+            placeholder="Yukarıdan okutun veya 13 haneli EAN-13 yazıp Enter'a basın...",
         ).strip()
     with c_b2:
         st.write("")
@@ -830,11 +1115,14 @@ with tab2:
         st.session_state["s2_form_versiyon"] += 1
 
     form_v = st.session_state["s2_form_versiyon"]
+    katalog_map = {k["Barkod"]: k for k in durum["katalog"]}
+    gecerli_mi, _, hata_metni = barkod_dogrula(barkod_giris, set(katalog_map.keys()))
 
     if not barkod_giris:
-        st.info("👆 Kayıt açmak için yukarıdan bir ürün barkodu okutun veya barkod numarasını yazın.")
+        st.info("👆 Kayıt açmak için yukarıdan bir ürün barkodu okutun veya geçerli bir EAN-13 barkod yazın.")
+    elif not gecerli_mi:
+        st.error(hata_metni)
     else:
-        katalog_map = {k["Barkod"]: k for k in durum["katalog"]}
         kayitli = katalog_map.get(barkod_giris)
 
         if kayitli:
@@ -842,14 +1130,19 @@ with tab2:
             reyon = kayitli["Reyon"]
             kategori = kayitli["Kategori"]
             max_omur = int(kayitli["Max_Raf_Omru_Gun"])
-            birim_fiyat = float(kayitli["Birim_Fiyat"])
-            gunluk_hiz = int(kayitli["Gunluk_Hiz"])
+            birim_fiyat = kayitli.get("Birim_Fiyat")
+            gunluk_hiz = kayitli.get("Gunluk_Hiz")
+            fiyat_yazi = f"{float(birim_fiyat):.0f} TL" if birim_fiyat is not None else "Bilinmiyor"
+            hiz_yazi = f"{int(gunluk_hiz)}/gün" if gunluk_hiz is not None else "Henüz bilinmiyor"
             st.info(
                 f"✅ **Katalogdan Otomatik Tanındı:** **{urun_adi}** | Reyon: **{reyon}** | "
-                f"Kategori: **{kategori}** (Max {max_omur} gün) | Fiyat: **{birim_fiyat:.0f} TL**"
+                f"Kategori: **{kategori}** (Max {max_omur} gün) | Fiyat: **{fiyat_yazi}** | Hız: **{hiz_yazi}**"
             )
         else:
-            st.warning(f"🆕 **Kayıtsız Barkod (`{barkod_giris}`):** Önceki ürün temizlendi. Paket üzerindeki bilgileri boş alanlara girin:")
+            st.warning(
+                f"🆕 **Geçerli Yeni Barkod (`{barkod_giris}`):** Önceki ürün temizlendi. "
+                "Yalnızca yıldızlı (*) temel alanları doldurmanız yeterlidir."
+            )
             n1, n2 = st.columns(2)
             with n1:
                 urun_adi = st.text_input(
@@ -878,22 +1171,22 @@ with tab2:
             n3, n4 = st.columns(2)
             with n3:
                 birim_fiyat = st.number_input(
-                    "Birim Fiyat (TL) *",
+                    "Birim Fiyat (TL — Opsiyonel)",
                     min_value=1.0,
                     max_value=5000.0,
                     value=None,
                     step=1.0,
-                    placeholder="Örn: 45",
+                    placeholder="Boş bırakılabilir (POS'tan gelir)",
                     key=f"s2_fiyat_{form_v}",
                 )
             with n4:
                 gunluk_hiz = st.number_input(
-                    "Tahmini Günlük Satış Hızı *",
+                    "Günlük Satış Hızı (Opsiyonel)",
                     min_value=1,
                     max_value=500,
                     value=None,
                     step=1,
-                    placeholder="Örn: 5",
+                    placeholder="Boş = Hız henüz bilinmiyor",
                     key=f"s2_hiz_{form_v}",
                 )
 
@@ -923,17 +1216,13 @@ with tab2:
             eksikler.append("Reyon")
         if kategori is None:
             eksikler.append("Kategori")
-        if birim_fiyat is None:
-            eksikler.append("Birim Fiyat")
-        if gunluk_hiz is None:
-            eksikler.append("Günlük Hız")
         if yeni_adet is None:
             eksikler.append("Adet")
         if secilen_skt is None:
             eksikler.append("SKT")
 
         if eksikler:
-            st.caption(f"🔒 Kayıt için doldurulması gereken zorunlu alanlar: **{', '.join(eksikler)}**")
+            st.caption(f"🔒 Kayıt için zorunlu alanlar: **{', '.join(eksikler)}** (Fiyat ve Hız opsiyoneldir)")
 
         if st.button(
             "➕ Diske Kaydet ve 2D Haritayı Güncelle",
@@ -948,6 +1237,9 @@ with tab2:
                     f"(seçilen tarih: {kalan_gun} gün sonrası)."
                 )
             else:
+                hiz_kayit = int(gunluk_hiz) if gunluk_hiz is not None else None
+                fiyat_kayit = float(birim_fiyat) if birim_fiyat is not None else None
+
                 if not kayitli:
                     durum["katalog"].append({
                         "Barkod": barkod_giris,
@@ -955,8 +1247,8 @@ with tab2:
                         "Reyon": reyon,
                         "Kategori": kategori,
                         "Max_Raf_Omru_Gun": max_omur,
-                        "Gunluk_Hiz": int(gunluk_hiz),
-                        "Birim_Fiyat": float(birim_fiyat),
+                        "Gunluk_Hiz": hiz_kayit,
+                        "Birim_Fiyat": fiyat_kayit,
                     })
 
                 yeni_pid = f"P-{durum['parti_sayaci']:03d}"
@@ -969,31 +1261,36 @@ with tab2:
                     "Dun_Stok": int(yeni_adet),
                     "Satilan_Adet": 0,
                     "Kalan_Stok": int(yeni_adet),
-                    "Gunluk_Hiz": int(gunluk_hiz),
+                    "Gunluk_Hiz": hiz_kayit,
                     "SKT": secilen_skt.strftime("%Y-%m-%d"),
-                    "Birim_Fiyat": float(birim_fiyat),
+                    "Birim_Fiyat": fiyat_kayit,
                     "Kaynak": "Yeni İlk Giriş",
                     "Coklu_Parti_Uyari": False,
                     "Sifir_Dogrulama_Gerekli": False,
                     "Son_Aksiyon_Tarihi": None,
                     "Son_Aksiyon_Tipi": "",
+                    "Son_Fiziksel_Kontrol": kontrol_tarihi.isoformat(),
                     "Mudahale_Notu": "",
                 })
                 durumu_diske_yaz(durum)
+                hiz_ek = "" if hiz_kayit is not None else " (Satış hızı henüz bilinmiyor — tarih bazlı izlenecek)"
                 st.session_state["son_ilk_giris_mesaj"] = (
                     f"✅ **{urun_adi}** (`{barkod_giris}`, {int(yeni_adet)} adet, SKT: {secilen_skt.strftime('%d.%m.%Y')}) "
-                    f"kaydedildi ve **{reyon}** reyonuna işlendi!"
+                    f"kaydedildi ve **{reyon}** reyonuna işlendi!{hiz_ek}"
                 )
                 st.session_state["s2_tarama_mesaj"] = None
                 st.session_state["s2_bekleyen_barkod"] = ""
                 st.rerun()
 
 # ==============================================================================
-# SEKME 3: KÖR SAYIM (MAL KABUL — OTOMATİK İRSALİYE EŞLEŞTİRME & TEMİZLEME)
+# SEKME 3: KÖR SAYIM (KARMA SKT KABULÜ + EAN-13 DOĞRULAMA + OTOMATİK TEMİZLEME)
 # ==============================================================================
 with tab3:
-    st.subheader("📦 Arka Kapı Dijital Gümrük (Kör Sayım)")
-    st.caption("Barkodu okuttuğunuzda bekleyen irsaliyedeki satır kendiliğinden seçilir; eşleşme yoksa önceki ürün silinir.")
+    st.subheader("📦 Arka Kapı Dijital Gümrük (Kör Sayım & Karma SKT)")
+    st.caption(
+        "Aynı irsaliye satırından farklı tarihler çıkarsa '➕ Farklı SKT Ekle' ile dağıtın; "
+        "tüm alt partilerin toplamı gizli irsaliyeyle karşılaştırılır ve her tarih ayrı parti olarak radara yazılır."
+    )
 
     bekleyen_irsaliye = [
         satir for satir in durum["irsaliye"]
@@ -1004,38 +1301,47 @@ with tab3:
         for s in bekleyen_irsaliye
     }
     secenek_listesi = list(secenekler.keys())
+    irsaliye_barkod_seti = {s["Barkod"] for s in bekleyen_irsaliye}
 
     st.session_state.setdefault("s3_barkod", "")
     st.session_state.setdefault("s3_son_barkod", "")
     st.session_state.setdefault("s3_secilen_etiket", None)
     st.session_state.setdefault("s3_son_secilen_etiket", None)
     st.session_state.setdefault("s3_form_versiyon", 0)
+    st.session_state.setdefault("s3_skt_satir_sayisi", 1)
 
     if "s3_bekleyen_barkod" in st.session_state:
         yeni_b3 = st.session_state.pop("s3_bekleyen_barkod")
         st.session_state["s3_barkod"] = yeni_b3
         st.session_state["s3_son_barkod"] = yeni_b3
         st.session_state["s3_form_versiyon"] += 1
+        st.session_state["s3_skt_satir_sayisi"] = 1
         st.session_state["bekleyen_kabul_uyari"] = None
 
         if yeni_b3:
-            eslesen_etiket = next(
-                (et for et, s in secenekler.items() if s["Barkod"] == yeni_b3),
-                None,
-            )
-            st.session_state["s3_secilen_etiket"] = eslesen_etiket
-            st.session_state["s3_son_secilen_etiket"] = eslesen_etiket
-            if eslesen_etiket:
-                st.session_state["s3_eslesme_durum"] = (
-                    "ok",
-                    f"✅ İrsaliyede otomatik seçildi: **{secenekler[eslesen_etiket]['Urun_Adi']}**",
-                )
+            gec_b3, _, hata_b3 = barkod_dogrula(yeni_b3, irsaliye_barkod_seti)
+            if not gec_b3:
+                st.session_state["s3_secilen_etiket"] = None
+                st.session_state["s3_son_secilen_etiket"] = None
+                st.session_state["s3_eslesme_durum"] = ("hata", hata_b3)
             else:
-                st.session_state["s3_eslesme_durum"] = (
-                    "hata",
-                    f"🚫 Barkod (`{yeni_b3}`) bekleyen gizli irsaliyede bulunamadı! "
-                    "Yanlış ürüne kayıt önlemek için önceki ürün seçimi temizlendi.",
+                eslesen_etiket = next(
+                    (et for et, s in secenekler.items() if s["Barkod"] == yeni_b3),
+                    None,
                 )
+                st.session_state["s3_secilen_etiket"] = eslesen_etiket
+                st.session_state["s3_son_secilen_etiket"] = eslesen_etiket
+                if eslesen_etiket:
+                    st.session_state["s3_eslesme_durum"] = (
+                        "ok",
+                        f"✅ İrsaliyede otomatik seçildi: **{secenekler[eslesen_etiket]['Urun_Adi']}**",
+                    )
+                else:
+                    st.session_state["s3_eslesme_durum"] = (
+                        "hata",
+                        f"🚫 Barkod (`{yeni_b3}`) bekleyen gizli irsaliyede bulunamadı! "
+                        "Yanlış ürüne kayıt önlemek için önceki ürün seçimi temizlendi.",
+                    )
         else:
             st.session_state["s3_secilen_etiket"] = None
             st.session_state["s3_son_secilen_etiket"] = None
@@ -1055,38 +1361,53 @@ with tab3:
     if st.session_state.get("s3_son_islem_mesaj"):
         st.success(st.session_state.s3_son_islem_mesaj)
 
-    def irsaliye_stoga_ekle(satir: dict, adet: int, skt_str: str, kaynak_etiketi: str, sonuc_metni: str, risk_tl: float, detay: str):
+    def irsaliye_partileri_stoga_ekle(
+        satir: dict,
+        partiler: list,
+        kaynak_etiketi: str,
+        sonuc_metni: str,
+        risk_tl: float,
+        detay: str,
+    ):
         if satir["Satir_ID"] in durum["islenen_irsaliye_idler"]:
             return
         durum["islenen_irsaliye_idler"].append(satir["Satir_ID"])
 
-        if adet > 0:
-            yeni_pid = f"P-{durum['parti_sayaci']:03d}"
-            durum["parti_sayaci"] += 1
-            durum["stok_kayitlari"].append({
-                "Parti_ID": yeni_pid,
-                "Barkod": satir["Barkod"],
-                "Urun_Adi": satir["Urun_Adi"],
-                "Reyon": satir["Reyon"],
-                "Dun_Stok": int(adet),
-                "Satilan_Adet": 0,
-                "Kalan_Stok": int(adet),
-                "Gunluk_Hiz": int(satir["Gunluk_Hiz"]),
-                "SKT": skt_str,
-                "Birim_Fiyat": float(satir["Birim_Fiyat"]),
-                "Kaynak": kaynak_etiketi,
-                "Coklu_Parti_Uyari": False,
-                "Sifir_Dogrulama_Gerekli": False,
-                "Son_Aksiyon_Tarihi": None,
-                "Son_Aksiyon_Tipi": "",
-                "Mudahale_Notu": "",
-            })
+        toplam_teslim = 0
+        skt_ozetleri = []
+        for prt in partiler:
+            adet = int(prt["adet"])
+            skt_iso = prt["skt_iso"]
+            toplam_teslim += adet
+            if adet > 0:
+                skt_ozetleri.append(f"{skt_iso} ({adet})")
+                yeni_pid = f"P-{durum['parti_sayaci']:03d}"
+                durum["parti_sayaci"] += 1
+                durum["stok_kayitlari"].append({
+                    "Parti_ID": yeni_pid,
+                    "Barkod": satir["Barkod"],
+                    "Urun_Adi": satir["Urun_Adi"],
+                    "Reyon": satir["Reyon"],
+                    "Dun_Stok": adet,
+                    "Satilan_Adet": 0,
+                    "Kalan_Stok": adet,
+                    "Gunluk_Hiz": satir.get("Gunluk_Hiz"),
+                    "SKT": skt_iso,
+                    "Birim_Fiyat": satir.get("Birim_Fiyat"),
+                    "Kaynak": kaynak_etiketi,
+                    "Coklu_Parti_Uyari": False,
+                    "Sifir_Dogrulama_Gerekli": False,
+                    "Son_Aksiyon_Tarihi": None,
+                    "Son_Aksiyon_Tipi": "",
+                    "Son_Fiziksel_Kontrol": kontrol_tarihi.isoformat(),
+                    "Mudahale_Notu": "",
+                })
 
         durum["kabul_kayitlari"].insert(0, {
             "Satir_ID": satir["Satir_ID"],
             "Ürün": satir["Urun_Adi"],
-            "Teslim_Adet": adet,
-            "SKT": skt_str,
+            "Teslim_Adet": toplam_teslim,
+            "Parti_Dagilimi": " + ".join(skt_ozetleri) if skt_ozetleri else "Reddedildi (0)",
             "Sonuc": sonuc_metni,
             "Engellenen_TL": risk_tl,
             "Detay": detay,
@@ -1094,8 +1415,10 @@ with tab3:
         st.session_state["bekleyen_kabul_uyari"] = None
         st.session_state["s3_tarama_mesaj"] = None
         st.session_state["s3_bekleyen_barkod"] = ""
+        st.session_state["s3_skt_satir_sayisi"] = 1
         st.session_state["s3_son_islem_mesaj"] = (
-            f"✅ **{satir['Urun_Adi']}** ({sonuc_metni} — {adet} adet) işlendi ve satır kilitlendi."
+            f"✅ **{satir['Urun_Adi']}** ({sonuc_metni} — toplam {toplam_teslim} adet · "
+            f"{' + '.join(skt_ozetleri) if skt_ozetleri else '0'}) işlendi ve satır kilitlendi."
         )
         durumu_diske_yaz(durum)
 
@@ -1114,9 +1437,9 @@ with tab3:
         c_i1, c_i2 = st.columns([3, 1])
         with c_i1:
             irsaliye_barkod_giris = st.text_input(
-                "🔍 Barkod ile İrsaliye Bul",
+                "🔍 Barkod ile İrsaliye Bul (Örn: 8691234567890)",
                 key="s3_barkod",
-                placeholder="Barkodu okutun veya elle yazıp Enter'a basın...",
+                placeholder="Barkodu okutun veya 13 haneli EAN-13 yazıp Enter'a basın...",
             ).strip()
         with c_i2:
             st.write("")
@@ -1148,6 +1471,7 @@ with tab3:
 
         if secilen_etiket != st.session_state["s3_son_secilen_etiket"]:
             st.session_state["s3_son_secilen_etiket"] = secilen_etiket
+            st.session_state["s3_skt_satir_sayisi"] = 1
             st.session_state["bekleyen_kabul_uyari"] = None
 
         if secilen_etiket is None:
@@ -1155,99 +1479,146 @@ with tab3:
         else:
             satir = secenekler[secilen_etiket]
             form_v3 = st.session_state["s3_form_versiyon"]
+            satir_sayisi = st.session_state["s3_skt_satir_sayisi"]
 
             st.markdown(
                 f"**Aktif İrsaliye Satırı:** `{satir['Satir_ID']}` · **{satir['Urun_Adi']}** "
                 f"({satir['Reyon']} / {satir['Kategori']} — Max raf ömrü: {satir['Max_Raf_Omru_Gun']} gün)"
             )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                sayilan_adet = st.number_input(
-                    "Fiziksel Sayılan Adet *",
-                    min_value=0,
-                    max_value=1000,
-                    value=None,
-                    step=1,
-                    placeholder="Fiilen saydığınız adedi yazın...",
-                    key=f"s3_adet_{satir['Satir_ID']}_{form_v3}",
-                )
-            with c2:
-                girilen_skt = st.date_input(
-                    "Paket Üzerindeki SKT *",
-                    value=None,
-                    format="DD.MM.YYYY",
-                    key=f"s3_skt_{satir['Satir_ID']}_{form_v3}",
-                )
+            girilen_satirlar = []
+            for idx in range(satir_sayisi):
+                c1, c2 = st.columns(2)
+                with c1:
+                    adet_val = st.number_input(
+                        f"Fiziksel Adet (Parti {idx + 1}) *",
+                        min_value=0 if satir_sayisi == 1 else 1,
+                        max_value=1000,
+                        value=None,
+                        step=1,
+                        placeholder="Bu tarihten kaç adet var?",
+                        key=f"s3_adet_{satir['Satir_ID']}_{form_v3}_{idx}",
+                    )
+                with c2:
+                    skt_val = st.date_input(
+                        f"Paket Üzerindeki SKT (Parti {idx + 1}) *",
+                        value=None,
+                        format="DD.MM.YYYY",
+                        key=f"s3_skt_{satir['Satir_ID']}_{form_v3}_{idx}",
+                    )
+                girilen_satirlar.append((adet_val, skt_val))
 
-            eksik_s3 = []
-            if sayilan_adet is None:
-                eksik_s3.append("Fiziksel Adet")
-            if girilen_skt is None:
-                eksik_s3.append("SKT")
+            b_ekle, b_sil, b_ozet = st.columns([1.2, 1.2, 2])
+            with b_ekle:
+                if st.button("➕ Farklı SKT Ekle", disabled=(satir_sayisi >= 6), use_container_width=True):
+                    st.session_state["s3_skt_satir_sayisi"] = satir_sayisi + 1
+                    st.session_state["bekleyen_kabul_uyari"] = None
+                    st.rerun()
+            with b_sil:
+                if st.button("➖ Son Satırı Kaldır", disabled=(satir_sayisi <= 1), use_container_width=True):
+                    st.session_state["s3_skt_satir_sayisi"] = satir_sayisi - 1
+                    st.session_state["bekleyen_kabul_uyari"] = None
+                    st.rerun()
+            with b_ozet:
+                dolu_toplam = sum(int(a) for a, _ in girilen_satirlar if a is not None)
+                st.caption(f"📦 Girilen Toplam Adet: **{dolu_toplam}** ({satir_sayisi} SKT satırı)")
 
-            if eksik_s3:
-                st.caption(f"🔒 Doğrulama için doldurun: **{', '.join(eksik_s3)}**")
+            eksik_var = any(a is None or t is None for a, t in girilen_satirlar)
+            if eksik_var:
+                st.caption("🔒 Tüm satırlarda fiziksel adet ve SKT doldurulmadan doğrulama açılmaz.")
 
             if st.button(
                 "🔒 Kör Sayımı Doğrula",
                 type="primary",
-                disabled=bool(eksik_s3),
+                disabled=eksik_var,
                 use_container_width=True,
             ):
-                beklenen = satir["Beklenen_Adet"]
-                max_omur = satir["Max_Raf_Omru_Gun"]
-                hiz = satir["Gunluk_Hiz"]
-                fiyat = satir["Birim_Fiyat"]
-                kalan_gun = (girilen_skt - kontrol_tarihi).days
-                skt_iso = girilen_skt.strftime("%Y-%m-%d")
+                # Aynı SKT iki kez girildiyse otomatik birleştir
+                birlesik_map = {}
+                for adet_v, skt_v in girilen_satirlar:
+                    iso = skt_v.strftime("%Y-%m-%d")
+                    birlesik_map[iso] = birlesik_map.get(iso, 0) + int(adet_v)
 
-                if kalan_gun <= 0:
-                    st.error(f"🔴 **KAPI 1 BLOK:** Tarihi geçmiş ürün ({girilen_skt.strftime('%d.%m.%Y')}) teslim alınamaz!")
+                partiler_temiz = [
+                    {"skt_iso": iso, "adet": adet, "gun": (datetime.date.fromisoformat(iso) - kontrol_tarihi).days}
+                    for iso, adet in sorted(birlesik_map.items())
+                ]
+
+                beklenen = int(satir["Beklenen_Adet"])
+                max_omur = int(satir["Max_Raf_Omru_Gun"])
+                hiz = satir.get("Gunluk_Hiz")
+                fiyat_sayisal = float(satir["Birim_Fiyat"]) if satir.get("Birim_Fiyat") is not None else 0.0
+                toplam_sayilan = sum(x["adet"] for x in partiler_temiz)
+
+                # KAPI 1: Tüm alt partiler için SKT & sahte tarih kontrolü
+                kapi1_hata = None
+                for prt in partiler_temiz:
+                    if prt["gun"] <= 0:
+                        kapi1_hata = f"🔴 **KAPI 1 BLOK:** Tarihi geçmiş parti ({prt['skt_iso']}) teslim alınamaz!"
+                        break
+                    if prt["gun"] > max_omur:
+                        kapi1_hata = (
+                            f"🚫 **KAPI 1 BLOK (SAHTE SKT):** {satir['Kategori']} max {max_omur} gündür "
+                            f"({prt['skt_iso']} tarihi {prt['gun']} gün sonrası)."
+                        )
+                        break
+
+                if kapi1_hata:
+                    st.error(kapi1_hata)
                     st.session_state["bekleyen_kabul_uyari"] = None
-                elif kalan_gun > max_omur:
-                    st.error(
-                        f"🚫 **KAPI 1 BLOK (SAHTE SKT):** {satir['Kategori']} max {max_omur} gündür "
-                        f"(siz {kalan_gun} gün sonrası girdiniz)."
-                    )
-                    st.session_state["bekleyen_kabul_uyari"] = None
-                elif int(sayilan_adet) != beklenen:
-                    fark = int(sayilan_adet) - beklenen
-                    kayip_tl = round(abs(fark) * fiyat, 2)
+                elif toplam_sayilan != beklenen:
+                    fark = toplam_sayilan - beklenen
+                    kayip_tl = round(abs(fark) * fiyat_sayisal, 2)
                     yon = "EKSİK" if fark < 0 else "FAZLA"
                     st.session_state["bekleyen_kabul_uyari"] = {
                         "tip": "ADET_FARKI",
                         "satir": satir,
-                        "sayilan": int(sayilan_adet),
-                        "skt_iso": skt_iso,
+                        "partiler": partiler_temiz,
                         "risk_tl": kayip_tl,
                         "mesaj": (
                             f"🚨 **KAPI 2 ALARM ({abs(fark)} ADET {yon} — {kayip_tl:,.0f} TL):** "
-                            "Gizli irsaliye tutmuyor! Tekrar sayın ya da tutanakla fiili adedi teslim alın."
-                        ),
-                    }
-                elif int(sayilan_adet) > (hiz * kalan_gun):
-                    satilabilir = hiz * kalan_gun
-                    elde_kalacak = int(sayilan_adet) - satilabilir
-                    risk_tl = round(elde_kalacak * fiyat, 2)
-                    st.session_state["bekleyen_kabul_uyari"] = {
-                        "tip": "KISA_OMUR",
-                        "satir": satir,
-                        "sayilan": int(sayilan_adet),
-                        "skt_iso": skt_iso,
-                        "risk_tl": risk_tl,
-                        "mesaj": (
-                            f"🟠 **KAPI 3 UYARI — KISA RAF ÖMRÜ ({risk_tl:,.0f} TL RİSK):** "
-                            f"Adet tam ({int(sayilan_adet)}) ama {hiz}/gün hızla {kalan_gun} günde en fazla {satilabilir} adet satılır; "
-                            f"**{elde_kalacak} adet elde kalacak.**"
+                            f"Girilen toplam (**{toplam_sayilan} adet**) gizli irsaliyeyle tutmuyor! "
+                            "Tekrar sayın ya da tutanakla fiili dağılımı teslim alın."
                         ),
                     }
                 else:
-                    irsaliye_stoga_ekle(
-                        satir, int(sayilan_adet), skt_iso, "Kör Sayım Onaylı",
-                        "ONAYLANDI", 0.0, "3 kapıdan temiz geçti ve radara işlendi"
-                    )
-                    st.rerun()
+                    # KAPI 3: Karma SKT partileri arası paylaşımlı kapasite kontrolü
+                    toplam_elde_kalacak = 0
+                    tasan_notlar = []
+                    if hiz is not None and int(hiz) > 0:
+                        kullanilan_kap = 0
+                        for prt in partiler_temiz:
+                            uygun_kap = max(0, int(hiz) * prt["gun"] - kullanilan_kap)
+                            satilabilir = min(prt["adet"], uygun_kap)
+                            tasan = prt["adet"] - satilabilir
+                            kullanilan_kap += satilabilir
+                            if tasan > 0:
+                                toplam_elde_kalacak += tasan
+                                tasan_notlar.append(f"{prt['skt_iso']} ({tasan} adet)")
+
+                    if toplam_elde_kalacak > 0:
+                        risk_tl = round(toplam_elde_kalacak * fiyat_sayisal, 2)
+                        st.session_state["bekleyen_kabul_uyari"] = {
+                            "tip": "KISA_OMUR",
+                            "satir": satir,
+                            "partiler": partiler_temiz,
+                            "risk_tl": risk_tl,
+                            "mesaj": (
+                                f"🟠 **KAPI 3 UYARI — KISA RAF ÖMRÜ ({risk_tl:,.0f} TL RİSK):** "
+                                f"Toplam adet tam (**{toplam_sayilan}**) ama {int(hiz)}/gün hızla "
+                                f"**{toplam_elde_kalacak} adet elde kalacak** ({', '.join(tasan_notlar)})."
+                            ),
+                        }
+                    else:
+                        irsaliye_partileri_stoga_ekle(
+                            satir,
+                            partiler_temiz,
+                            "Kör Sayım Onaylı",
+                            "ONAYLANDI",
+                            0.0,
+                            f"{len(partiler_temiz)} parti 3 kapıdan temiz geçti ve radara işlendi",
+                        )
+                        st.rerun()
 
             uyari = st.session_state.get("bekleyen_kabul_uyari")
             if uyari and uyari["satir"]["Satir_ID"] == satir["Satir_ID"]:
@@ -1259,22 +1630,20 @@ with tab3:
                 u1, u2 = st.columns(2)
                 with u1:
                     if st.button("⚠️ Riskli / Tutanaklı Fiilen Teslim Aldım (Radara Ekle)", use_container_width=True):
-                        irsaliye_stoga_ekle(
+                        irsaliye_partileri_stoga_ekle(
                             uyari["satir"],
-                            uyari["sayilan"],
-                            uyari["skt_iso"],
+                            uyari["partiler"],
                             "Riskli Kabul (Radarda)",
                             f"RİSKLİ KABUL ({uyari['tip']})",
                             uyari["risk_tl"],
-                            "Uyarıya rağmen fiilen teslim alındı ve T+1 radarına eklendi",
+                            "Uyarıya rağmen fiilen teslim alındı ve tüm alt partiler radara eklendi",
                         )
                         st.rerun()
                 with u2:
                     if st.button("❌ Malı Kapıda Reddettim (İade)", use_container_width=True):
-                        irsaliye_stoga_ekle(
+                        irsaliye_partileri_stoga_ekle(
                             uyari["satir"],
-                            0,
-                            uyari["skt_iso"],
+                            [],
                             "Kapıda Reddedildi",
                             f"REDDEDİLDİ ({uyari['tip']})",
                             uyari["risk_tl"],
